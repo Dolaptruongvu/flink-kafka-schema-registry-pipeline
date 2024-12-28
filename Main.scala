@@ -1,128 +1,163 @@
-import org.apache.flink.streaming.api.scala._
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
-import org.apache.flink.connector.kafka.source.KafkaSource
-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema
-import org.apache.flink.api.common.eventtime.WatermarkStrategy
-import io.confluent.kafka.schemaregistry.client.{CachedSchemaRegistryClient, SchemaRegistryClient}
-import org.apache.avro.Schema
-import org.apache.avro.generic.GenericRecord
-import org.apache.avro.io.{DatumReader, DecoderFactory}
-import org.apache.avro.specific.SpecificDatumReader
-import java.nio.ByteBuffer
-import org.slf4j.LoggerFactory
-import org.apache.flink.api.common.serialization.DeserializationSchema
+import org.apache.flink.api.common.serialization.SimpleStringSchema
 import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.api.scala._
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.streaming.connectors.kafka.{FlinkKafkaConsumer}
+import java.util.{Properties, ArrayList}
+import java.nio.charset.StandardCharsets
+import org.apache.flink.api.common.serialization.DeserializationSchema
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import scalaj.http.Http
+import org.everit.json.schema.{Schema, ValidationException}
+import org.everit.json.schema.loader.SchemaLoader
+import org.json.JSONObject
 
-// HTTP Client Imports
-import org.apache.http.client.methods.{CloseableHttpResponse, HttpPost}
-import org.apache.http.impl.client.CloseableHttpClient
-import org.apache.http.impl.client.HttpClients
-import org.apache.http.entity.StringEntity
-import com.fasterxml.jackson.databind.ObjectMapper
-import scala.collection.JavaConverters._
+import scala.collection.mutable.ListBuffer
 
-/**
-  * Avro Deserialization Schema with Schema Validation
-  */
-class AvroDeserializationSchemaMultiple(schemaRegistryUrl: String, allowedSchemaIds: Set[Int])
-  extends DeserializationSchema[GenericRecord] {
+// Định nghĩa Order
+case class Order(customer_id: String, amount: Double, order_date: String)
 
-  @transient lazy val schemaRegistryClient: SchemaRegistryClient =
-    new CachedSchemaRegistryClient(schemaRegistryUrl, 10)
+// Deserialization và validate schema
+class OrderDeserializationSchema(expectedVersion: String) extends DeserializationSchema[Order] {
 
-  override def deserialize(message: Array[Byte]): GenericRecord = {
-    val magicByte = message(0)
-    if (magicByte != 0) {
-      throw new RuntimeException(s"Magic byte != 0, found $magicByte")
-    }
-
-    val schemaId = ByteBuffer.wrap(message, 1, 4).getInt
-    if (!allowedSchemaIds.contains(schemaId)) {
-      throw new RuntimeException(s"Schema ID $schemaId is not allowed!")
-    }
-
-    val avroData = message.slice(5, message.length)
-    val avroSchema: Schema = schemaRegistryClient.getById(schemaId) match {
-      case s: Schema => s
-      case _         => throw new RuntimeException(s"Schema ID $schemaId not found")
-    }
-
-    val reader: DatumReader[GenericRecord] = new SpecificDatumReader[GenericRecord](avroSchema)
-    val decoder = DecoderFactory.get().binaryDecoder(avroData, null)
-    reader.read(null, decoder)
+  @transient private lazy val objectMapper: ObjectMapper = {
+    val mapper = new ObjectMapper()
+    mapper.registerModule(DefaultScalaModule)
+    mapper
   }
 
-  override def isEndOfStream(nextElement: GenericRecord): Boolean = false
+  @transient private var schemaValidator: Schema = _
 
-  override def getProducedType: TypeInformation[GenericRecord] =
-    TypeInformation.of(classOf[GenericRecord])
+  // Lấy schema từ registry và tạo validator
+  private def loadSchemaValidator(version: String): Unit = {
+    try {
+      val response = Http(s"http://localhost:8081/subjects/orders2-value/versions/$version").asString
+      if (response.isError) {
+        println(s"Error fetching schema: ${response.body}")
+        return
+      }
+      val schemaNode = objectMapper.readTree(response.body).get("schema")
+      val schemaObject = new JSONObject(schemaNode.asText())
+      schemaValidator = SchemaLoader.load(schemaObject)
+      println("Schema loaded and validator initialized.")
+    } catch {
+      case e: Exception =>
+        println(s"Failed to load schema from registry: ${e.getMessage}")
+    }
+  }
+
+  override def open(context: DeserializationSchema.InitializationContext): Unit = {
+    loadSchemaValidator(expectedVersion)
+  }
+
+  override def deserialize(message: Array[Byte]): Order = {
+    val filteredMessage = message.dropWhile(b => b == 0 || b == 1)
+    val json = new String(filteredMessage, StandardCharsets.UTF_8)
+    println(s"Raw JSON from Kafka: $json")
+
+    val messageNode = objectMapper.readTree(json)
+
+    if (schemaValidator == null) {
+      println("Warning: Schema validator is null. Skipping validation.")
+    } else {
+      try {
+        schemaValidator.validate(new JSONObject(messageNode.toString))
+        println("JSON message is valid.")
+      } catch {
+        case e: ValidationException =>
+          println(s"Schema validation failed: ${e.getMessage}")
+          println("Skipping invalid record but continuing job...")
+          return null  // Trả về null để bỏ qua bản ghi
+      }
+    }
+    objectMapper.readValue(json, classOf[Order])
+  }
+
+
+  override def isEndOfStream(nextElement: Order): Boolean = false
+
+  override def getProducedType: TypeInformation[Order] = createTypeInformation[Order]
 }
 
-/**
-  * Flink Kafka Consumer App
-  */
-object FlinkKafkaConsumerAppMultipleSchemas {
-  val logger = LoggerFactory.getLogger(FlinkKafkaConsumerAppMultipleSchemas.getClass)
-
+// Kafka Consumer Flink
+object KafkaFlinkConsumerApp {
   def main(args: Array[String]): Unit = {
     val env = StreamExecutionEnvironment.getExecutionEnvironment
-    env.getConfig.enableObjectReuse()
 
-    val allowedSchemaIds: Set[Int] = Set(1, 2, 102, 103)
-    val schemaRegistryUrl = "http://localhost:8081"
-    val avroDeserializer = new AvroDeserializationSchemaMultiple(schemaRegistryUrl, allowedSchemaIds)
+    val properties = new Properties()
+    properties.setProperty("bootstrap.servers", "localhost:9092")
+    properties.setProperty("group.id", "flink-consumer-group")
 
-    val kafkaSource = KafkaSource.builder()
-      .setBootstrapServers("localhost:9092")
-      .setTopics("orders")
-      .setGroupId("flink-group")
-      .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(avroDeserializer))
-      .build()
+    // Xác định schema version mong muốn
+    val expectedSchemaVersion = "1"
 
-    logger.info("Kafka Source configured.")
+    println(s"Fetching schema for subject: orders2-value, version: $expectedSchemaVersion...")
 
-    val stream = env.fromSource(kafkaSource, WatermarkStrategy.noWatermarks(), "Kafka Source")
-    logger.info("Consuming data from Kafka...")
+    val response = Http(s"http://localhost:8081/subjects/orders2-value/versions/$expectedSchemaVersion").asString
 
-    val batchBuffer = scala.collection.mutable.ListBuffer[GenericRecord]()
-
-    stream
-      .map { record =>
-        logger.info(s"Received valid Avro data: $record")
-        batchBuffer += record
-
-        if (batchBuffer.size >= 10) {
-          sendToAPI(batchBuffer.toList)
-          batchBuffer.clear()
-        }
-        record
-      }
-      .print()
-
-    env.execute("Flink Kafka Consumer Multiple Schemas Validation")
-  }
-
-  def sendToAPI(records: List[GenericRecord]): Unit = {
-    val httpClient: CloseableHttpClient = HttpClients.createDefault()
-    val post = new HttpPost("http://localhost:8080/batch")
+    if (response.isError) {
+      println(s"Failed to fetch schema: ${response.body}")
+      return
+    }
 
     val objectMapper = new ObjectMapper()
-    val jsonListString = objectMapper.writeValueAsString(records.map(_.toString).asJava)
+    objectMapper.registerModule(DefaultScalaModule)
+    val schemaNode = objectMapper.readTree(response.body)
 
-    post.setEntity(new StringEntity(jsonListString, "UTF-8"))
-    post.setHeader("Content-type", "application/json")
+    println("Fetched Schema from Registry:")
+    println(schemaNode.toPrettyString())
 
-    val response: CloseableHttpResponse = httpClient.execute(post)
-    try {
-      val statusCode = response.getStatusLine.getStatusCode
-      if (statusCode != 200) {
-        logger.error(s"Failed to send records! HTTP Code: $statusCode")
-      } else {
-        logger.info(s"Successfully sent ${records.size} records to API.")
+    // Buffer để gom batch
+    val batchBuffer = ListBuffer[Order]()
+
+    // Tạo Kafka Consumer
+    val kafkaConsumer = new FlinkKafkaConsumer[Order](
+      "orders2",
+      new OrderDeserializationSchema(expectedSchemaVersion),
+      properties
+    )
+
+    val stream = env.addSource(kafkaConsumer)
+
+    // Thu thập và xử lý batch
+    stream.map { order =>
+      batchBuffer.append(order)
+      println(s"Order added to batch: $order")
+
+      if (batchBuffer.size >= 5) {
+        println(s"Sending batch of size ${batchBuffer.size} to API...")
+        sendBatchToAPI(batchBuffer.toList)
+        batchBuffer.clear()
       }
-    } finally {
-      response.close()
-      httpClient.close()
+
+      order
+    }.name("Batch Processor")
+
+    env.execute("Flink Kafka JSON Schema Consumer with Batch API")
+  }
+
+    // Hàm gửi batch đến API Flask (di chuyển vào trong object)
+  def sendBatchToAPI(batch: List[Order]): Unit = {
+    try {
+      val objectMapper = new ObjectMapper()
+      objectMapper.registerModule(DefaultScalaModule)  // Đảm bảo Jackson hỗ trợ Scala case class
+
+      val jsonBatch = objectMapper.writeValueAsString(batch)
+
+      val response = Http("http://localhost:8080/batch")
+        .postData(jsonBatch)
+        .header("Content-Type", "application/json")
+        .asString
+
+      if (response.is2xx) {
+        println(s"Batch sent successfully: ${response.body}")
+      } else {
+        println(s"Failed to send batch: ${response.body}")
+      }
+    } catch {
+      case e: Exception => println(s"Error sending batch to API: ${e.getMessage}")
     }
   }
+
 }

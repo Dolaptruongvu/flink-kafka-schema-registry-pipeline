@@ -1,51 +1,52 @@
-# kafka_producer.py
-
+#!/usr/bin/env python
 from confluent_kafka import SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka.schema_registry.json_schema import JSONSerializer
 from confluent_kafka.serialization import StringSerializer
-import json
 import time
+import json
 
-# 1. Configure Schema Registry
 schema_registry_conf = {'url': 'http://localhost:8081'}
 schema_registry_client = SchemaRegistryClient(schema_registry_conf)
 
-# 2. Read the registered schema from Schema Registry
-subject = 'orders-value'
-schema_str = schema_registry_client.get_latest_version(subject).schema.schema_str
+subject_name = "orders2-value"
+schema_response = schema_registry_client.get_latest_version(subject_name)
+order_schema = schema_response.schema.schema_str
 
-# 3. Create Avro Serializer
-avro_serializer = AvroSerializer(schema_registry_client, schema_str)
+json_serializer = JSONSerializer(
+    order_schema,
+    schema_registry_client,
+    to_dict=lambda x, ctx: x
+)
 
-# 4. Configure Kafka Producer
 producer_conf = {
-    'bootstrap.servers': 'localhost:9092',  # Ensure Kafka broker is listening on localhost
-    'key.serializer': StringSerializer('utf_8'),  # Serializer for key
-    'value.serializer': avro_serializer           # Serializer for value (Avro)
+    'bootstrap.servers': 'localhost:9092',
+    'key.serializer': StringSerializer('utf_8'),
+    'value.serializer': json_serializer
 }
 producer = SerializingProducer(producer_conf)
 
-# 5. Create Order Data
-order = {
-    "order_id": "12345",
-    "customer_id": "C003",
-    "amount": 300.5,
-    "order_date": "2024-12-25"
-}
+def send_order(order):
+    try:
+        # Không encode dưới dạng byte
+        producer.produce(
+            topic='orders2',
+            key=order['customer_id'],
+            value=order,  # Truyền object trực tiếp
+            on_delivery=lambda err, msg: print(f"Message {'failed' if err else 'sent'} to {msg.topic()}")
+        )
+    except Exception as e:
+        print(f"Failed to send: {e}")
 
-# 6. Delivery Callback
-def delivery_report(err, msg):
-    if err is not None:
-        print(f'Failed to deliver message: {err}')
-    else:
-        print(f'Message delivered to {msg.topic()} [{msg.partition()}]')
-
-# 7. Produce Messages
+# Gửi dữ liệu
 for i in range(5):
-    order['order_id'] = f"1000{i}"
-    order['amount'] = 100 + i * 50
-    producer.produce(topic='orders', key=order['order_id'], value=order, on_delivery=delivery_report)
-    time.sleep(1)  # Simulate sending data every second
+    order = {
+        "customer_id": f"CUST-{i}",
+        "amount": 100 + i * 50,
+        "order_date": f"2024-12-{25 + i}"
+    }
+    send_order(order)
+    time.sleep(1)
 
-producer.flush()  # Ensure all messages are sent
+producer.flush()
+print("Done producing JSON messages.")
